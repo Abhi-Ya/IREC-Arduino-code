@@ -13,14 +13,45 @@
   GPS on digital pins 3 (RX) and 4 (TX)
   
 */
-
-
-
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
+
+// === TCA9548A Multiplexer Helper ===
+void tca_select(uint8_t channel) {
+  if (channel > 7) return;
+  Wire.beginTransmission(0x70);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+// === BME280 Setup ===
+#define SEALEVELPRESSURE_HPA (1013.25)
+Adafruit_BME280 bme;
+bool bme_ok = false;
+
+// === MPU6050 #1 (0x68 on channel 6) Variables ===
+float RateRoll1, RatePitch1, RateYaw1;
+float RateCalibrationRoll1, RateCalibrationPitch1, RateCalibrationYaw1;
+float AccX1, AccY1, AccZ1;
+float AngleRoll1, AnglePitch1;
+float KalmanAngleRoll1 = 0, KalmanUncertaintyAngleRoll1 = 4;
+float KalmanAnglePitch1 = 0, KalmanUncertaintyAnglePitch1 = 4;
+bool mpu1_ok = true;
+
+// === MPU6050 #2 (0x69 on channel 7) Variables ===
+float RateRoll2, RatePitch2, RateYaw2;
+float RateCalibrationRoll2, RateCalibrationPitch2, RateCalibrationYaw2;
+float AccX2, AccY2, AccZ2;
+float AngleRoll2, AnglePitch2;
+float KalmanAngleRoll2 = 0, KalmanUncertaintyAngleRoll2 = 4;
+float KalmanAnglePitch2 = 0, KalmanUncertaintyAnglePitch2 = 4;
+bool mpu2_ok = true;
+
+// === Kalman Filter Output Buffer ===
+float Kalman1DOutput[] = {0, 0};
 
 // === GPS Setup ===
 static const int RXPin = 4, TXPin = 3;
@@ -28,167 +59,180 @@ static const uint32_t GPSBaud = 9600;
 TinyGPSPlus gps;
 SoftwareSerial ss(RXPin, TXPin);
 
-// === Multiplexer ===
-#define TCAADDR 0x70
-void tcaSelect(uint8_t channel) {
-  if (channel > 7) return;
-  Wire.beginTransmission(TCAADDR);
-  Wire.write(1 << channel);
-  Wire.endTransmission();
-}
+uint32_t LoopTimer;
 
-// === BME280 on Channel 1 ===
-Adafruit_BME280 bme;
-bool bme_ok = false;
-
-// === MPU6050 Shared Code ===
-struct MPU6050Data {
-  uint8_t channel;
-  uint8_t address;
-  bool ok;
-  float RateRoll, RatePitch, RateYaw;
-  float AccX, AccY, AccZ;
-  float AngleRoll, AnglePitch;
-  float KalmanAngleRoll = 0, KalmanUncertaintyAngleRoll = 4.0;
-  float KalmanAnglePitch = 0, KalmanUncertaintyAnglePitch = 4.0;
-  float RateCalibrationRoll = 0, RateCalibrationPitch = 0, RateCalibrationYaw = 0;
-  bool read_ok = false;
-};
-
-MPU6050Data mpu1 = {7, 0x68, true};
-MPU6050Data mpu2 = {6, 0x69, true};
-
-float Kalman1DOutput[2];
-
-void kalman_1d(float& KalmanState, float& KalmanUncertainty, float KalmanInput, float KalmanMeasurement) {
+// === Kalman Filter Function ===
+void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, float KalmanMeasurement) {
   KalmanState += 0.004 * KalmanInput;
   KalmanUncertainty += 0.004 * 0.004 * 16;
   float KalmanGain = KalmanUncertainty / (KalmanUncertainty + 9);
   KalmanState += KalmanGain * (KalmanMeasurement - KalmanState);
   KalmanUncertainty *= (1 - KalmanGain);
+  Kalman1DOutput[0] = KalmanState;
+  Kalman1DOutput[1] = KalmanUncertainty;
 }
 
-bool readMPU6050(MPU6050Data &mpu) {
-  tcaSelect(mpu.channel);
-  
-  Wire.beginTransmission(mpu.address);
+// === Read MPU6050 Data (Generic Function) ===
+bool read_mpu6050(uint8_t channel, uint8_t addr,
+                  float &RateRoll, float &RatePitch, float &RateYaw,
+                  float &AccX, float &AccY, float &AccZ,
+                  float &AngleRoll, float &AnglePitch) {
+  tca_select(channel);
+  Wire.beginTransmission(addr);
   Wire.write(0x3B);
   if (Wire.endTransmission() != 0) return false;
-  Wire.requestFrom(mpu.address, 6);
+  Wire.requestFrom(addr, 6);
   if (Wire.available() < 6) return false;
-  int16_t AccXLSB = Wire.read() << 8 | Wire.read();
-  int16_t AccYLSB = Wire.read() << 8 | Wire.read();
-  int16_t AccZLSB = Wire.read() << 8 | Wire.read();
+  int16_t ax = Wire.read() << 8 | Wire.read();
+  int16_t ay = Wire.read() << 8 | Wire.read();
+  int16_t az = Wire.read() << 8 | Wire.read();
 
-  Wire.beginTransmission(mpu.address);
+  Wire.beginTransmission(addr);
   Wire.write(0x43);
   if (Wire.endTransmission() != 0) return false;
-  Wire.requestFrom(mpu.address, 6);
+  Wire.requestFrom(addr, 6);
   if (Wire.available() < 6) return false;
-  int16_t GyroX = Wire.read() << 8 | Wire.read();
-  int16_t GyroY = Wire.read() << 8 | Wire.read();
-  int16_t GyroZ = Wire.read() << 8 | Wire.read();
+  int16_t gx = Wire.read() << 8 | Wire.read();
+  int16_t gy = Wire.read() << 8 | Wire.read();
+  int16_t gz = Wire.read() << 8 | Wire.read();
 
-  mpu.RateRoll = (float)GyroX / 65.5 - mpu.RateCalibrationRoll;
-  mpu.RatePitch = (float)GyroY / 65.5 - mpu.RateCalibrationPitch;
-  mpu.RateYaw = (float)GyroZ / 65.5 - mpu.RateCalibrationYaw;
+  RateRoll = (float)gx / 65.5;
+  RatePitch = (float)gy / 65.5;
+  RateYaw = (float)gz / 65.5;
 
-  mpu.AccX = (float)AccXLSB / 4096 - 0.05;
-  mpu.AccY = (float)AccYLSB / 4096 + 0.01;
-  mpu.AccZ = (float)AccZLSB / 4096 - 0.11;
+  AccX = (float)ax / 4096 - 0.05;
+  AccY = (float)ay / 4096 + 0.01;
+  AccZ = (float)az / 4096 - 0.11;
 
-  mpu.AngleRoll = atan(mpu.AccY / sqrt(mpu.AccX * mpu.AccX + mpu.AccZ * mpu.AccZ)) * 180 / PI;
-  mpu.AnglePitch = -atan(mpu.AccX / sqrt(mpu.AccY * mpu.AccY + mpu.AccZ * mpu.AccZ)) * 180 / PI;
-
-  kalman_1d(mpu.KalmanAngleRoll, mpu.KalmanUncertaintyAngleRoll, mpu.RateRoll, mpu.AngleRoll);
-  kalman_1d(mpu.KalmanAnglePitch, mpu.KalmanUncertaintyAnglePitch, mpu.RatePitch, mpu.AnglePitch);
+  AngleRoll = atan(AccY / sqrt(AccX * AccX + AccZ * AccZ)) * 180 / PI;
+  AnglePitch = -atan(AccX / sqrt(AccY * AccY + AccZ * AccZ)) * 180 / PI;
 
   return true;
 }
 
-void calibrateMPU(MPU6050Data& mpu) {
-  tcaSelect(mpu.channel);
-  for (int i = 0; i < 1000; i++) {
-    if (!readMPU6050(mpu)) {
-      mpu.ok = false;
-      return;
-    }
-    mpu.RateCalibrationRoll += mpu.RateRoll;
-    mpu.RateCalibrationPitch += mpu.RatePitch;
-    mpu.RateCalibrationYaw += mpu.RateYaw;
-    delay(1);
-  }
-  mpu.RateCalibrationRoll /= 1000;
-  mpu.RateCalibrationPitch /= 1000;
-  mpu.RateCalibrationYaw /= 1000;
-  mpu.ok = true;
-}
-
 void setup() {
   Serial.begin(57600);
-  Wire.begin();
   Wire.setClock(400000);
-  ss.begin(GPSBaud);
+  Wire.begin();
 
-  // Setup BME280
-  tcaSelect(1);
+  // === BME280 ===
+  tca_select(1);
   bme_ok = bme.begin(0x76);
 
-  // Wake up both MPUs
-  tcaSelect(mpu1.channel);
-  Wire.beginTransmission(mpu1.address);
+  // === MPU6050 #1 init (0x68 on channel 6) ===
+  tca_select(6);
+  Wire.beginTransmission(0x68);
   Wire.write(0x6B);
-  Wire.write(0);
+  Wire.write(0x00);
   Wire.endTransmission();
-
-  tcaSelect(mpu2.channel);
-  Wire.beginTransmission(mpu2.address);
-  Wire.write(0x6B);
-  Wire.write(0);
-  Wire.endTransmission();
-
   delay(250);
 
-  calibrateMPU(mpu1);
-  calibrateMPU(mpu2);
+  // === MPU6050 #2 init (0x69 on channel 7) ===
+  tca_select(7);
+  Wire.beginTransmission(0x69);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  delay(250);
+
+  // === Calibration ===
+  for (int i = 0; i < 2000; i++) {
+    if (!read_mpu6050(6, 0x68, RateRoll1, RatePitch1, RateYaw1, AccX1, AccY1, AccZ1, AngleRoll1, AnglePitch1)) {
+      mpu1_ok = false;
+      break;
+    }
+    RateCalibrationRoll1 += RateRoll1;
+    RateCalibrationPitch1 += RatePitch1;
+    RateCalibrationYaw1 += RateYaw1;
+
+    if (!read_mpu6050(7, 0x69, RateRoll2, RatePitch2, RateYaw2, AccX2, AccY2, AccZ2, AngleRoll2, AnglePitch2)) {
+      mpu2_ok = false;
+      break;
+    }
+    RateCalibrationRoll2 += RateRoll2;
+    RateCalibrationPitch2 += RatePitch2;
+    RateCalibrationYaw2 += RateYaw2;
+
+    delay(1);
+  }
+
+  if (mpu1_ok) {
+    RateCalibrationRoll1 /= 2000;
+    RateCalibrationPitch1 /= 2000;
+    RateCalibrationYaw1 /= 2000;
+  }
+  if (mpu2_ok) {
+    RateCalibrationRoll2 /= 2000;
+    RateCalibrationPitch2 /= 2000;
+    RateCalibrationYaw2 /= 2000;
+  }
+
+  ss.begin(GPSBaud);
+  LoopTimer = micros();
 }
 
-uint32_t LoopTimer;
-
 void loop() {
-  // Read GPS
   while (ss.available() > 0) gps.encode(ss.read());
 
-  // Read Sensors
-  mpu1.read_ok = mpu1.ok && readMPU6050(mpu1);
-  mpu2.read_ok = mpu2.ok && readMPU6050(mpu2);
+  // === Read and Process MPU1 ===
+  bool mpu1_read_ok = false;
+  if (mpu1_ok) {
+    mpu1_read_ok = read_mpu6050(6, 0x68, RateRoll1, RatePitch1, RateYaw1, AccX1, AccY1, AccZ1, AngleRoll1, AnglePitch1);
+    if (mpu1_read_ok) {
+      RateRoll1 -= RateCalibrationRoll1;
+      RatePitch1 -= RateCalibrationPitch1;
+      kalman_1d(KalmanAngleRoll1, KalmanUncertaintyAngleRoll1, RateRoll1, AngleRoll1);
+      KalmanAngleRoll1 = Kalman1DOutput[0];
+      KalmanUncertaintyAngleRoll1 = Kalman1DOutput[1];
 
-  tcaSelect(1); // Switch to BME280
-  float humidity = bme_ok ? bme.readHumidity() : -1;
-  float temperature = bme_ok ? bme.readTemperature() : -1;
-  float pressure = bme_ok ? bme.readPressure() / 100.0F : -1;
-  float altitude = bme_ok ? bme.readAltitude(1013.25) : -1;
+      kalman_1d(KalmanAnglePitch1, KalmanUncertaintyAnglePitch1, RatePitch1, AnglePitch1);
+      KalmanAnglePitch1 = Kalman1DOutput[0];
+      KalmanUncertaintyAnglePitch1 = Kalman1DOutput[1];
+    }
+  }
+
+  // === Read and Process MPU2 ===
+  bool mpu2_read_ok = false;
+  if (mpu2_ok) {
+    mpu2_read_ok = read_mpu6050(7, 0x69, RateRoll2, RatePitch2, RateYaw2, AccX2, AccY2, AccZ2, AngleRoll2, AnglePitch2);
+    if (mpu2_read_ok) {
+      RateRoll2 -= RateCalibrationRoll2;
+      RatePitch2 -= RateCalibrationPitch2;
+      kalman_1d(KalmanAngleRoll2, KalmanUncertaintyAngleRoll2, RateRoll2, AngleRoll2);
+      KalmanAngleRoll2 = Kalman1DOutput[0];
+      KalmanUncertaintyAngleRoll2 = Kalman1DOutput[1];
+
+      kalman_1d(KalmanAnglePitch2, KalmanUncertaintyAnglePitch2, RatePitch2, AnglePitch2);
+      KalmanAnglePitch2 = Kalman1DOutput[0];
+      KalmanUncertaintyAnglePitch2 = Kalman1DOutput[1];
+    }
+  }
 
   // === Output ===
-  Serial.print("BME | H: "); Serial.print(humidity != -1 ? String(humidity) : "--");
-  Serial.print("% | T: "); Serial.print(temperature != -1 ? String(temperature) : "--");
-  Serial.print("C | P: "); Serial.print(pressure != -1 ? String(pressure) : "--");
-  Serial.print("hPa | Alt: "); Serial.print(altitude != -1 ? String(altitude) : "--"); Serial.println("m");
+  tca_select(1);
+  Serial.print(bme_ok ? String(bme.readHumidity()) : "--"); Serial.print("% | ");
+  Serial.print(bme_ok ? String(bme.readTemperature()) : "--"); Serial.print("*C | ");
+  Serial.print(bme_ok ? String(bme.readPressure() / 100.0F) : "--"); Serial.print("hPa | ");
+  Serial.print(bme_ok ? String(bme.readAltitude(SEALEVELPRESSURE_HPA)) : "--"); Serial.print("m | ");
 
-  Serial.print("MPU1 | Roll: "); Serial.print(mpu1.read_ok ? mpu1.KalmanAngleRoll : --); Serial.print("° ");
-  Serial.print("| Pitch: "); Serial.println(mpu1.read_ok ? mpu1.KalmanAnglePitch : --);
+  Serial.print("MPU1: ");
+  Serial.print(mpu1_read_ok ? String(KalmanAngleRoll1) : "--"); Serial.print("° / ");
+  Serial.print(mpu1_read_ok ? String(KalmanAnglePitch1) : "--"); Serial.print("° | ");
 
-  Serial.print("MPU2 | Roll: "); Serial.print(mpu2.read_ok ? mpu2.KalmanAngleRoll : --); Serial.print("° ");
-  Serial.print("| Pitch: "); Serial.println(mpu2.read_ok ? mpu2.KalmanAnglePitch : --);
+  Serial.print("MPU2: ");
+  Serial.print(mpu2_read_ok ? String(KalmanAngleRoll2) : "--"); Serial.print("° / ");
+  Serial.print(mpu2_read_ok ? String(KalmanAnglePitch2) : "--"); Serial.print("° | ");
 
   if (gps.location.isUpdated()) {
-    Serial.print("GPS | Lat: "); Serial.print(gps.location.lat(), 6);
-    Serial.print(" | Lon: "); Serial.print(gps.location.lng(), 6);
-    Serial.print(" | Speed: "); Serial.print(gps.speed.mps());
-    Serial.print(" m/s | Alt: "); Serial.println(gps.altitude.meters());
+    Serial.print("Lat: "); Serial.print(gps.location.lat(), 6); Serial.print(" | ");
+    Serial.print("Lon: "); Serial.print(gps.location.lng(), 6); Serial.print(" | ");
+    Serial.print("Speed: "); Serial.print(gps.speed.mps()); Serial.print(" m/s | ");
+    Serial.print("Alt: "); Serial.print(gps.altitude.meters()); Serial.println(" m");
   } else {
     Serial.println("GPS: --");
   }
 
-  delay(10);
+  while (micros() - LoopTimer < 10000);
+  LoopTimer = micros();
 }
+
